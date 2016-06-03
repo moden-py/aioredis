@@ -82,7 +82,7 @@ class GenericCommandsMixin:
         if replace:
             flags.append(b'REPLACE')
         fut = self.execute(b'MIGRATE', host, port,
-                                         key, dest_db, timeout, *flags)
+                           key, dest_db, timeout, *flags)
         return wait_ok(fut)
 
     def move(self, key, db):
