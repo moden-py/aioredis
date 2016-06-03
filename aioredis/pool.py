@@ -1,10 +1,11 @@
 import asyncio
 import collections
 import sys
+import warnings
 
-from .commands import create_redis, Redis
+from .connection import create_connection
 from .log import logger
-from .util import async_task
+from .util import async_task, _NOTSET
 from .errors import PoolClosedError
 
 
@@ -13,7 +14,7 @@ PY_35 = sys.version_info >= (3, 5)
 
 @asyncio.coroutine
 def create_pool(address, *, db=0, password=None, ssl=None, encoding=None,
-                minsize=1, maxsize=10, commands_factory=Redis, loop=None):
+                minsize=1, maxsize=10, commands_factory=_NOTSET, loop=None):
     """Creates Redis Pool.
 
     By default it creates pool of commands_factory instances, but it is
@@ -24,21 +25,24 @@ def create_pool(address, *, db=0, password=None, ssl=None, encoding=None,
 
     Returns RedisPool instance.
     """
+    if commands_factory is not _NOTSET:
+        warnings.warn(
+            "commands_factory argument is deprecated and will be removed!",
+            warnings.DeprecationWarning)
 
-    pool = RedisPool(address, db, password, encoding,
-                     minsize=minsize, maxsize=maxsize,
-                     commands_factory=commands_factory,
-                     ssl=ssl, loop=loop)
+    pool = ConnectionsPool(address, db, password, encoding,
+                           minsize=minsize, maxsize=maxsize,
+                           ssl=ssl, loop=loop)
     yield from pool._fill_free(override_min=False)
     return pool
 
 
-class RedisPool:
+class ConnectionsPool:
     """Redis connections pool.
     """
 
     def __init__(self, address, db=0, password=None, encoding=None,
-                 *, minsize, maxsize, commands_factory, ssl=None, loop=None):
+                 *, minsize, maxsize, ssl=None, loop=None):
         assert isinstance(minsize, int) and minsize >= 0, (
             "minsize must be int >= 0", minsize, type(minsize))
         assert maxsize is not None, "Arbitrary pool size is disallowed."
@@ -54,7 +58,6 @@ class RedisPool:
         self._ssl = ssl
         self._encoding = encoding
         self._minsize = minsize
-        self._factory = commands_factory
         self._loop = loop
         self._pool = collections.deque(maxlen=maxsize)
         self._used = set()
@@ -138,6 +141,54 @@ class RedisPool:
         """Current set codec or None."""
         return self._encoding
 
+    def execute(self, command, *args, **kw):
+        """Executes redis command in a free connection and returns
+        future waiting for result.
+
+        Picks connection from free pool and send command through
+        that connection.
+        If no connection is found, returns coroutine waiting for
+        free connection to execute command.
+        """
+        conn, address = self.get_connection(command, args)
+        if conn is not None:
+            fut = conn.execute(command, *args, **kw)
+            return self._check_result(fut, command, args, kw)
+        else:
+            coro = self._wait_execute(address, command, args, kw)
+            return self._check_result(coro, command, args, kw)
+
+    def get_connection(self, command, args):
+        """Get free connection from pool.
+
+        Returns connection and its address.
+        """
+        # TODO: find a better way to determine if connection is free
+        #       and not havily used.
+        for i in range(self.freesize):
+            conn = self._pool[0]
+            self._pool.rotate(1)
+            if conn.closed:  # or conn._waiters:
+                continue
+            return conn, None
+        return None, None
+
+    def _check_result(self, fut, *data):
+        """Hook to check result or catch exception (like MovedError).
+
+        This method can be coroutine.
+        """
+        return fut
+
+    @asyncio.coroutine
+    def _wait_execute(self, address, command, args, kw):
+        """Acquire connection and execute command."""
+        conn, address = yield from self.acquire(command, args)
+        try:
+            return (yield from conn.execute(command, *args, **kw))
+        finally:
+            self.release(conn)
+
     @asyncio.coroutine
     def select(self, db):
         """Changes db index for all free connections.
@@ -168,7 +219,7 @@ class RedisPool:
                     assert not conn.closed, conn
                     assert conn not in self._used, (conn, self._used)
                     self._used.add(conn)
-                    return conn
+                    return conn, self._address
                 else:
                     yield from self._cond.wait()
 
@@ -213,10 +264,11 @@ class RedisPool:
     def _fill_free(self, *, override_min):
         # drop closed connections first
         self._drop_closed()
+        address = self._address
         while self.size < self.minsize:
             self._acquiring += 1
             try:
-                conn = yield from self._create_new_connection()
+                conn = yield from self._create_new_connection(address)
                 self._pool.append(conn)
             finally:
                 self._acquiring -= 1
@@ -228,21 +280,20 @@ class RedisPool:
             while not self._pool and self.size < self.maxsize:
                 self._acquiring += 1
                 try:
-                    conn = yield from self._create_new_connection()
+                    conn = yield from self._create_new_connection(address)
                     self._pool.append(conn)
                 finally:
                     self._acquiring -= 1
                     # connection may be closed at yeild point
                     self._drop_closed()
 
-    def _create_new_connection(self):
-        return create_redis(self._address,
-                            db=self._db,
-                            password=self._password,
-                            ssl=self._ssl,
-                            encoding=self._encoding,
-                            commands_factory=self._factory,
-                            loop=self._loop)
+    def _create_new_connection(self, address):
+        return create_connection(address,
+                                 db=self._db,
+                                 password=self._password,
+                                 ssl=self._ssl,
+                                 encoding=self._encoding,
+                                 loop=self._loop)
 
     @asyncio.coroutine
     def _wakeup(self, closing_conn=None):
@@ -318,62 +369,3 @@ if PY_35:
             finally:
                 self._pool = None
                 self._conn = None
-
-
-class ConnectionPool(RedisPool):
-    """Connections pool.
-    """
-
-    def execute(self, command, *args, **kw):
-        """Executes redis command in a free connection and returns
-        future waiting for result.
-
-        Picks connection from free pool and send command through
-        that connection.
-        If no connection is found, returns coroutine waiting for
-        free connection to execute command.
-        """
-        conn, address = self.get_connection(command, args)
-        if conn is not None:
-            fut = conn.execute(command, *args, **kw)
-            return self._check_result(fut, command, args, kw)
-        else:
-            coro = self._wait_execute(address, command, args, kw)
-            return self._check_result(coro, command, args, kw)
-
-    def get_connection(self, command, args):
-        """Get free connection from pool.
-
-        Returns connection and its address.
-        """
-        # TODO: find a better way to determine if connection is free
-        #       and not havily used.
-        for i in range(self.freesize):
-            conn = self._pool[0]
-            self._pool.rotate(1)
-            if conn.closed:  # or conn._waiters:
-                continue
-            return conn, None
-        return None, None
-
-    @asyncio.coroutine
-    def acquire(self, command, args):
-        """Wait connection available and return it along with its address."""
-        conn = yield from super().acquire()
-        return conn, None
-
-    def _check_result(self, fut, *data):
-        """Hook to check result or catch exception (like MovedError).
-
-        This method can be coroutine.
-        """
-        return fut
-
-    @asyncio.coroutine
-    def _wait_execute(self, address, command, args, kw):
-        """Acquire connection and execute command."""
-        conn, address = yield from self.acquire(command, args)
-        try:
-            return (yield from conn.execute(command, *args, **kw))
-        finally:
-            self.release(conn)
