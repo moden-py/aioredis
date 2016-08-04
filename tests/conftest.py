@@ -179,6 +179,16 @@ def pytest_addoption(parser):
                      help="Run tests with uvloop")
 
 
+def pytest_sessionstart(session):
+    if os.environ.get('TRAVIS'):
+        print("\ntravis_fold:start:tests")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if os.environ.get('TRAVIS'):
+        print("\ntravis_fold:end:tests")
+
+
 def _read_server_version(config):
     args = [config.getoption('--redis-server'), '--version']
     with subprocess.Popen(args, stdout=subprocess.PIPE) as proc:
