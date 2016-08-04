@@ -152,7 +152,7 @@ def serverB(start_server):
 
 
 @pytest.fixture(scope='session')
-def sentinel(start_sentinel, start_server):
+def sentinel(start_sentinel, request, start_server):
     """Starts redis-sentinel instance with one master -- masterA."""
     masterA = start_server('masterA', [
         'slave-read-only yes',
@@ -212,8 +212,15 @@ def start_server(_proc, request, unused_port):
     """
 
     version = _read_server_version(request.config)
+    verbose = request.config.getoption('-v') > 3
 
     servers = {}
+
+    def timeout(t):
+        end = time.time() + t
+        while time.time() <= end:
+            yield True
+        raise RuntimeError("Redis startup timeout expired")
 
     def maker(name, config_lines=None):
         if name in servers:
@@ -246,9 +253,12 @@ def start_server(_proc, request, unused_port):
                      *args,
                      stdout=subprocess.PIPE,
                      _clear_tmp_files=tmp_files)
-        log = b''
-        while b'The server is now ready to accept connections ' not in log:
+        for _ in timeout(3):
             log = proc.stdout.readline()
+            if log and verbose:
+                print(log)
+            if b'The server is now ready to accept connections ' in log:
+                break
 
         info = RedisServer(name, tcp_address, unixsocket, version)
         servers.setdefault(name, info)
@@ -261,6 +271,7 @@ def start_server(_proc, request, unused_port):
 def start_sentinel(_proc, request, unused_port, start_server):
     """Starts Redis Sentinel instances."""
     version = _read_server_version(request.config)
+    verbose = request.config.getoption('-v') > 3
 
     sentinels = {}
 
@@ -268,6 +279,7 @@ def start_sentinel(_proc, request, unused_port, start_server):
         end = time.time() + t
         while time.time() <= end:
             yield True
+        raise RuntimeError("Redis startup timeout expired")
 
     def maker(name, *masters):
         key = (name,) + masters
@@ -294,6 +306,8 @@ def start_sentinel(_proc, request, unused_port, start_server):
                      _clear_tmp_files=[config])
         for _ in timeout(3):
             log = proc.stdout.readline()
+            if log and verbose:
+                print(log)
             if b'# +monitor master ' in log:
                 break
         else:
